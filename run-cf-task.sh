@@ -1,6 +1,8 @@
 #!/bin/bash
 debug=false
 workdir="/brtlvrs"
+host_repo_root="~/cf-task-project/repo"
+repo_root_name="repo"
 
 function _header() {
 
@@ -27,14 +29,16 @@ function _usage() {
 
     options:
 
-    -h | --help         this message
-    -t | --task <path>  full path to concourse task.yml
-    -r | --repo <path>  path to root folder for config repo
+    -h | --help             this message
+    -t | --task <path>      full path to concourse task.yml
+    -r | --repo_root <path> path to root folder for config repo
+    -n | --repo_name <var>  name of config repo root folder in container
     -d | --debug        show debug messages
 EOF
 }
 
 function debug() {
+    # send debug message to STDERR
     [[ $debug == true ]] && echo "DBG: $@" >&2
 }
 
@@ -42,7 +46,6 @@ function _parse_options() {
     # parse script arguments
     local option
     local options=()
-    debug=true
 
     # guardrail: are there any arguments ?
     if [[ $# -eq 0 ]]; then
@@ -79,12 +82,19 @@ function _parse_options() {
             echo "Expected value for option $option but got option $next_value"
             exit 1
         fi
+
+        ((i++))
     }
     # handle arguments
     for (( i=0 ; i< ${#options[@]}; i++)) do
         option="${options[i]}"
         case ${option} in
             -d | --debug ) # set debug variable to true
+                debug=false
+                show_docker=true
+            ;;
+            -dd )
+                show_docker=true
                 debug=true
             ;;
             -h | --help ) # show help message
@@ -93,13 +103,17 @@ function _parse_options() {
             ;;
             -t | --task ) # path to concourse task file
                 validate_value
-                _parse_task "${options[i + 1]}"
-                ((i++)) # skip nexzt item in the array, it is not an option
+                _parse_task "${options[i]}"
                 ;;
-            -r | --repo ) # path to repo
+            -r | --repo_root ) # path to repo
                 validate_value
-                host_repo_folder="${options[i + 1]}"
-                ((i++)) # skip nexzt item in the array, it is not an option
+                host_repo_root="${options[i]}"
+                debug "host_repo_root: $host_repo_root"
+                ;;
+            -n | --repo_name ) 
+                validate_value
+                repo_root_name="${options[i]}"
+                debug "repo_root_name: $repo_root_name"
                 ;;
             *)
                 echo "unknown script option $option"
@@ -114,23 +128,35 @@ function _parse_options() {
 function _parse_task()
 {
     debug=true
-    # Check if the task.yml file is provided as argument
-    if [ $# -ne 1 ]; then
-        echo "Usage: $0 <task.yml>"
-        exit 1
-    fi
 
     task_yml="$1"
+    debug "Processing Concourse task file $task_yml"
 
-    # Check if the task.yml file exists
+    # GUARDRAIL Check if the task.yml file exists
     if [ ! -f "$task_yml" ]; then
         echo "Error: Task YAML file '$task_yml' not found"
         exit 1
     fi
 
+    # GUARDRAIL check if yq is installed
+    if ! command -v yq &>/dev/null; then
+        echo "yq is not installed, cannot parse $task_yml"
+        exit 1
+    fi
+
+    # GUARDRAIL check image_resource type
+    if [[ $(yq e '.image_resource.type' "$task_yml") != "registry-image" ]]; then
+        echo "image_resoure type defined in $task_yml is not 'registry-image'"
+        exit 1
+    fi
+
     # Parse task.yml for Docker image and script path
+    debug "image resource type: $(yq -e '.image_resource.type' $task_yml)"
+
     docker_image=$(yq e '.image_resource.source.repository + ":" + .image_resource.source.tag' "$task_yml")
+    debug "docker_image: $docker_image "
     script_path=$(yq e '.run.path' "$task_yml")
+    debug "script_path: $script_path"
 
     # Create an array to store input and output mount points
     input_mounts=()
@@ -140,26 +166,58 @@ function _parse_task()
     inputs=$(yq e '.inputs[].name' "$task_yml")
     outputs=$(yq e '.outputs[].name' "$task_yml")
 
-    for input in $inputs; do
-        input_mounts+=("-v $PWD/$input:/$input")
+    for ((i=0 ; i < ${#inputs[@]}; i++)) do
+        local input="${inputs[i]}"
+
+        # check if input is a config repo
+        if [[ "$input"  == "$repo_root_name" ]]; then
+            echo "Found repo in inputs."
+            input_mounts+=("-v $host_repo_root:$repo_root_name")
+            continue
+        fi
+
+        local mount=$PWD/$input:$workdir/$input
+        debug "mount: $mount"
+        input_mounts+=("-v $mount")
     done
+
+    debug "input_mounts: ${input_mounts[@]}"
 
     for output in $outputs; do
         output_mounts+=("-v $PWD/$output:/$output")
     done
+    debug "output_mounts: ${output_mounts[@]}"
 
-    # Run the Docker container with environment variables, symbolic link, and interactive shell
-    docker run --rm -it \
-        "${input_mounts[@]}" \
-        "${output_mounts[@]}" \
-        -e "$env_vars" \
-        -w $workdir \
-        "$docker_image" \
-        /bin/bash -c "ln -s $script_path /work/task && /bin/bash"
+}
 
+_show_docker_params() {
+
+    cat <<EOF
+
+    Docker run parameters
+
+    --rm
+    -it
+    --workdir   $workdir
+    ${input_mounts[@]}
+    ${output_mounts[@]}
+    image       $docker_image
+
+EOF
 }
 
 ##MAIN
 _header
 _parse_options "$@"
-debug "host_repo_folder: $host_repo_folder"
+
+# show docker parameters
+[[ $show_docker == "true" ]] && _show_docker_params
+
+# Run the Docker container with environment variables, symbolic link, and interactive shell
+docker run --rm -it \
+    "${input_mounts[@]}" \
+    "${output_mounts[@]}" \
+    -e "$env_vars" \
+    -w $workdir \
+    "$docker_image" \
+    /bin/bash -c "ln -s $script_path /work/task && /bin/bash"
