@@ -66,8 +66,8 @@ function _parse_options() {
     done
 
     function validate_value() {
-
-        debug "i: $i - ${#options[@]}"
+        # validate the next item in the options array 
+        
         if [[ $i -eq $(( ${#options[@]} - 1 ))  ]]; then
             ## argument was the last argument set, not followed with a value
             echo "Option $option has no value set"
@@ -83,7 +83,6 @@ function _parse_options() {
     # handle arguments
     for (( i=0 ; i< ${#options[@]}; i++)) do
         option="${options[i]}"
-        debug "i: $i/$((${#options[@]} - 1)) - option: $option"
         case ${option} in
             -d | --debug ) # set debug variable to true
                 debug=true
@@ -95,11 +94,12 @@ function _parse_options() {
             -t | --task ) # path to concourse task file
                 validate_value
                 _parse_task "${options[i + 1]}"
-                ((i++))
+                ((i++)) # skip nexzt item in the array, it is not an option
                 ;;
             -r | --repo ) # path to repo
-                ((i++))
-                host_repo_folder="${options[i]}"
+                validate_value
+                host_repo_folder="${options[i + 1]}"
+                ((i++)) # skip nexzt item in the array, it is not an option
                 ;;
             *)
                 echo "unknown script option $option"
