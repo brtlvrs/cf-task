@@ -103,7 +103,7 @@ function _parse_options() {
             ;;
             -t | --task ) # path to concourse task file
                 validate_value
-                _parse_task "${options[i]}"
+                task_file="${options[i]}"
                 ;;
             -r | --repo_root ) # path to repo
                 validate_value
@@ -125,12 +125,48 @@ function _parse_options() {
 }
 
 
-function _parse_task()
+function _parse_task_file()
 {
     debug=true
 
-    task_yml="$1"
-    debug "Processing Concourse task file $task_yml"
+    function parse_image_resource() {
+        echo "  - parsing .image_resource for docker image"
+        local image_version=$(yq e '.image_resource.source.tag' $task_yml) || "latest"
+        local image_repo=$(yq e '.image_resource.source.repository' "$task_yml") || ${echo "Couldn't find property .image_resource.source.repository."&& exit 1}
+        docker_image="$image_repo:$image_version"
+        debug "docker_image: $docker_image "
+    }
+
+    function parse_inputs() {
+        echo "  - parsing .inputs for docker -v mount options"
+        inputs=$(yq e '.inputs[].name' "$task_yml")
+        IFS=$'\n' read -r -d ' ' -a input_mounts <<< "$inputs"
+
+        # process found names in .inputs
+        for ((i=0 ; i < ${#input_mounts[@]}; i++)) do
+            local input="${input_mounts[i]}"
+
+            # check if input is the config repo
+            if [[ "$input"  == "$repo_root_name" ]]; then
+                echo "Found config repo in inputs."
+                host_repo_root="${host_repo_root/#\~/$HOME}"
+                mounts+=("-v $host_repo_root:$repo_root_name")
+                continue
+            fi
+
+            # input is not the config repo
+            local mount=$PWD/$input:$workdir/$input
+            mounts+=("-v $mount")
+        done
+    }
+
+    task_yml=$(readlink -f "$1")
+    echo "Processing Concourse task file $task_yml"
+
+    if [ -z $task_yml ]; then
+        debug "Skipping taskfile parsing."
+        return 0
+    fi
 
     # GUARDRAIL Check if the task.yml file exists
     if [ ! -f "$task_yml" ]; then
@@ -144,50 +180,59 @@ function _parse_task()
         exit 1
     fi
 
-    # GUARDRAIL check image_resource type
+    # GUARDRAIL check for image_resource type == registry-image
     if [[ $(yq e '.image_resource.type' "$task_yml") != "registry-image" ]]; then
         echo "image_resoure type defined in $task_yml is not 'registry-image'"
         exit 1
     fi
-
-    # Parse task.yml for Docker image and script path
     debug "image resource type: $(yq -e '.image_resource.type' $task_yml)"
 
-    docker_image=$(yq e '.image_resource.source.repository + ":" + .image_resource.source.tag' "$task_yml")
-    debug "docker_image: $docker_image "
+    # parsing .image_resource properties to set docker_image
+    if [[ $(yq e ' has("image_resource")' "$task_yml") != "true" ]]; then
+        echo "   .image_resource not found"
+        exit 1
+    fi
+    parse_image_resource
+
+
+    # parsing .run.path
+    yq e '.run | has(".path")' "$task_yml")
+    if [[ $(yq e '.run | has(".path")' "$task_yml") != "true" ]]; then
+        echo "    .run.path not found"
+        exit 1
+    fi
+    echo "  - parsing .run.path for task alias to create"
     script_path=$(yq e '.run.path' "$task_yml")
     debug "script_path: $script_path"
 
-    # Create an array to store input and output mount points
-    input_mounts=()
-    output_mounts=()
+    # Parse .inputs
+    if [[ $(yq e 'has(".inputs")' "$task_yml") != "true" ]]; then
+        echo "    .inputs not found"
+        exit 1
+    fi
+    parse_inputs
 
-    # Parse task.yml for inputs and outputs and create mount points
-    inputs=$(yq e '.inputs[].name' "$task_yml")
+    # parsing .outputs
+    echo "  - parsing .outputs for docker -v mount options"
     outputs=$(yq e '.outputs[].name' "$task_yml")
+    IFS=$'\n' read -r -d ' ' -a output_mounts <<< "$outputs"
 
-    for ((i=0 ; i < ${#inputs[@]}; i++)) do
-        local input="${inputs[i]}"
+    # process found names in .outputs
+    for ((i=0 ; i < ${#output_mounts[@]}; i++)) do
+        local output="${output_mounts[i]}"
 
-        # check if input is a config repo
-        if [[ "$input"  == "$repo_root_name" ]]; then
-            echo "Found repo in inputs."
-            input_mounts+=("-v $host_repo_root:$repo_root_name")
-            continue
-        fi
-
-        local mount=$PWD/$input:$workdir/$input
-        debug "mount: $mount"
-        input_mounts+=("-v $mount")
+        local mount=$PWD/$output:$workdir/$output
+        mounts+=("-v $mount")
     done
 
-    debug "input_mounts: ${input_mounts[@]}"
-
-    for output in $outputs; do
-        output_mounts+=("-v $PWD/$output:/$output")
+    # parse .params
+    # query only the keys under .params
+    echo "  - parsing .params for docker -e options"
+    local list=$(yq e '.params | keys' "$task_yml")
+    for item in $list; do
+        [[ $item == "-" ]] && continue # skip the dash
+        env_vars+=("-e $item")
     done
-    debug "output_mounts: ${output_mounts[@]}"
-
 }
 
 _show_docker_params() {
@@ -199,24 +244,26 @@ _show_docker_params() {
     --rm
     -it
     --workdir   $workdir
-    ${input_mounts[@]}
-    ${output_mounts[@]}
+    ${mounts[@]}
+    ${env_vars[@]}
     image       $docker_image
 
 EOF
 }
 
 ##MAIN
+mounts=()
+env_vars=()
 _header
 _parse_options "$@"
+_parse_task_file "$task_file"
 
 # show docker parameters
 [[ $show_docker == "true" ]] && _show_docker_params
 
 # Run the Docker container with environment variables, symbolic link, and interactive shell
 docker run --rm -it \
-    "${input_mounts[@]}" \
-    "${output_mounts[@]}" \
+    "${mounts[@]}" \
     -e "$env_vars" \
     -w $workdir \
     "$docker_image" \
